@@ -1,0 +1,164 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Example of connecting a dynamoDB stream to SNS via eventbridge pipes
+
+Resources:
+
+  PipeEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${AWS::StackName}-PipeEventBus'
+
+  # DynamoDB Table Creation with Stream Enabled
+  OrderDetailsDDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: OrderDetails
+      AttributeDefinitions:
+        - AttributeName: Id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: Id
+          KeyType: HASH
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      ProvisionedThroughput:
+        ReadCapacityUnits: 2
+        WriteCapacityUnits: 2
+
+  PipeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - pipes.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: SourcePolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "dynamodb:DescribeStream"
+                  - "dynamodb:GetRecords"
+                  - "dynamodb:GetShardIterator"
+                  - "dynamodb:ListStreams"
+                Resource: !GetAtt OrderDetailsDDBTable.StreamArn
+        - PolicyName: TargetPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                 - "events:PutEvents"
+                Resource: !GetAtt PipeEventBus.Arn
+           
+  Pipe:
+    Type: AWS::Pipes::Pipe
+    Properties:
+      Name: dynamodb-eventbridge-pipes
+      Description: "Pipe to connect DynamoDB Stream to EventBridge"
+      RoleArn: !GetAtt PipeRole.Arn
+      Source: !GetAtt OrderDetailsDDBTable.StreamArn
+      SourceParameters:
+        DynamoDBStreamParameters:
+          StartingPosition: LATEST
+          BatchSize: 1
+      Target: !GetAtt PipeEventBus.Arn
+
+  EventBridgeIAMRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub events.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: PutEventsDestinationBus
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'events:PutEvents'
+                Resource:
+                  - !GetAtt PipeEventBus.Arn
+
+  LogsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: EventBridgeLogRule
+      EventBusName: !Ref PipeEventBus
+      EventPattern:
+        source: 
+          - 'prefix' : ''
+        account:
+          - !Ref AWS::AccountId
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt LogGroupForEvents.Arn
+          Id: LogTarget
+
+  LogGroupForEvents:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/events/${AWS::StackName}'
+
+  LogGroupForEventsPolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: EventBridgeToCWLogsPolicy
+      PolicyDocument: !Sub >
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "EventBridgetoCWLogsCreateLogStreamPolicy",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": [
+                  "events.amazonaws.com"
+                ]
+              },
+              "Action": [
+                "logs:CreateLogStream"
+              ],
+              "Resource": [
+                "${LogGroupForEvents.Arn}"
+              ]
+            },
+            {
+              "Sid": "EventBridgetoCWLogsPutLogEventsPolicy",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": [
+                  "events.amazonaws.com"
+                ]
+              },
+              "Action": [
+                "logs:PutLogEvents"
+              ],
+              "Resource": [
+                "${LogGroupForEvents.Arn}"
+              ],
+              "Condition": {
+                "ArnEquals": {"AWS:SourceArn": "${LogsRule.Arn}"}
+              }
+            }
+          ]
+        }
+
+Outputs:
+  OrderDetailsTableName:
+    Value: !Ref OrderDetailsDDBTable
+  LogGroupName:
+    Value: !Ref LogGroupForEvents
